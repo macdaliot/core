@@ -37,10 +37,10 @@ class IPFW(object):
     def list_table(table_number):
         """ list ipfw table
         :param table_number: ipfw table number
-        :return: list
+        :return: dict (key value address + rule_number)
         """
         devnull = open(os.devnull, 'w')
-        result = list()
+        result = dict()
         with tempfile.NamedTemporaryFile() as output_stream:
             subprocess.check_call(['/sbin/ipfw', 'table', str(table_number), 'list'],
                                   stdout=output_stream,
@@ -49,14 +49,17 @@ class IPFW(object):
             for line in output_stream:
                 line = line.decode()
                 if line.split(' ')[0].strip() != "":
+                    parts = line.split()
+                    address = parts[0]
+                    rulenum = parts[1] if len(parts) > 1 else None
                     # process / 32 nets as single addresses to align better with the rule syntax
                     # and local administration.
-                    if line.split(' ')[0].split('/')[-1] == '32':
+                    if address.split('/')[-1] == '32':
                         # single IPv4 address
-                        result.append(line.split(' ')[0].split('/')[0])
-                    else:
+                        result[address.split('/')[0]] = rulenum
+                    elif not line.startswith('-'):
                         # network
-                        result.append(line.split(' ')[0])
+                        result[address] = rulenum
             return result
 
     def ip_or_net_in_table(self, table_number, address):
@@ -71,15 +74,24 @@ class IPFW(object):
 
         return False
 
-    @staticmethod
-    def add_to_table(table_number, address):
-        """ add new entry to ipfw table
+    def add_to_table(self, table_number, address):
+        """ add/update entry to ipfw table
         :param table_number: ipfw table number
         :param address: ip address or net to add to table
         :return:
         """
         devnull = open(os.devnull, 'w')
-        subprocess.call(['/sbin/ipfw', 'table', table_number, 'add', address], stdout=devnull, stderr=devnull)
+        ipfw_tbl = self.list_table(table_number)
+        rule_number = str(self._add_accounting(address))
+        if address not in ipfw_tbl:
+            subprocess.call(['/sbin/ipfw', 'table', str(table_number), 'add', address, rule_number],
+                            stdout=devnull, stderr=devnull)
+        elif str(ipfw_tbl[address]) != str(table_number):
+            # update table when accounting rule mismatches table entry
+            subprocess.call(['/sbin/ipfw', 'table', str(table_number), 'del', address],
+                            stdout=devnull, stderr=devnull)
+            subprocess.call(['/sbin/ipfw', 'table', str(table_number), 'add', address, rule_number],
+                            stdout=devnull, stderr=devnull)
 
     @staticmethod
     def delete_from_table(table_number, address):
@@ -107,7 +119,7 @@ class IPFW(object):
             for line in output_stream:
                 parts = line.decode().split()
                 if len(parts) > 5:
-                    if 30001 <= int(parts[0]) <= 50000 and parts[4] == 'count':
+                    if 30000 <= int(parts[0]) <= 50000 and parts[4] == 'count':
                         line_pkts = int(parts[1])
                         line_bytes = int(parts[2])
                         last_accessed = int(parts[3])
@@ -137,10 +149,10 @@ class IPFW(object):
 
             return result
 
-    def add_accounting(self, address):
+    def _add_accounting(self, address):
         """ add ip address for accounting
         :param address: ip address
-        :return: None
+        :return: added or known rule number
         """
         # search for unused rule number
         acc_info = self.list_accounting_info()
@@ -151,7 +163,7 @@ class IPFW(object):
                     rule_ids.append(acc_info[ip_address]['rule'])
 
             new_rule_id = -1
-            for ruleId in range(30001, 50000):
+            for ruleId in range(30000, 50000):
                 if ruleId not in rule_ids:
                     new_rule_id = ruleId
                     break
@@ -163,8 +175,17 @@ class IPFW(object):
                                 stdout=devnull, stderr=devnull)
                 subprocess.call(['/sbin/ipfw', 'add', str(new_rule_id), 'count', 'ip', 'from', 'any', 'to', address],
                                 stdout=devnull, stderr=devnull)
+                # end of accounting block lives at rule number 50000
+                subprocess.call(
+                    ['/sbin/ipfw', 'add', str(new_rule_id), 'skipto', '60000', 'ip', 'from', 'any', 'to', 'any'],
+                    stdout=devnull, stderr=devnull
+                )
 
-    def del_accounting(self, address):
+                return new_rule_id
+        else:
+            return acc_info[address]['rule']
+
+    def _del_accounting(self, address):
         """ remove ip address from accounting rules
         :param address: ip address
         :return: None
@@ -182,4 +203,4 @@ class IPFW(object):
         :return:
         """
         self.delete_from_table(table_number, address)
-        self.del_accounting(address)
+        self._del_accounting(address)
